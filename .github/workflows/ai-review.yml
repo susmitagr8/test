@@ -1,0 +1,46 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write   # needed later when we post comments
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ai-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Show PR info
+        run: |
+          echo "PR number: ${{ github.event.pull_request.number }}"
+          echo "Base commit: ${{ github.event.pull_request.base.sha }}"
+          echo "Head commit: ${{ github.event.pull_request.head.sha }}"
+
+      - name: Get PR diff
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.sha }}
+          git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} \
+            --unified=3 > pr_diff.txt
+
+          echo "==== Changed files ===="
+          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}
+
+          echo "==== First 40 lines of diff ===="
+          head -n 40 pr_diff.txt
+
+      - name: Upload diff as artifact (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-diff
+          path: pr_diff.txt
