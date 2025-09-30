@@ -144,13 +144,15 @@ jobs:
           path: review.json
 
       # ---- Create an inline review with comments on the diff
-      - name: Post inline review comments
+      - name: Post inline review comments (dedup)
         if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
+            const crypto = require('crypto');
+
             const pull_number = context.payload.pull_request.number;
             const headSha = context.payload.pull_request.head.sha;
 
@@ -161,10 +163,9 @@ jobs:
               core.warning('Failed to parse review.json: ' + (e?.message || e));
             }
 
-            // Build review comments array for GitHub's createReview
-            // We use line numbers relative to HEAD, on the RIGHT side.
-            const MAX = 12; // cap to avoid spam
-            const comments = (data.comments || []).slice(0, MAX).flatMap(c => {
+            // Build desired comments (capped)
+            const MAX = 12;
+            const desired = (data.comments || []).slice(0, MAX).flatMap(c => {
               if (!c?.file || !Number.isInteger(c?.start_line)) return [];
               const title = c.title || "AI Review";
               const rationale = c.rationale ? `\n\n${c.rationale}` : "";
@@ -172,27 +173,63 @@ jobs:
               const suggestion = c.suggestion ? ("\n\n" + c.suggestion) : "";
               const meta = `\n\n_Category:_ **${(c.category||'note').toUpperCase()}** · _Confidence:_ **${c.confidence ?? '-'} / 5**`;
 
+              // Create a stable fingerprint for deduplication
+              const fpPayload = JSON.stringify({
+                path: c.file,
+                line: c.start_line,
+                title,
+                suggestion: c.suggestion || "",
+              });
+              const fp = crypto.createHash('sha1').update(fpPayload).digest('hex');
+              const fpMarker = `\n\n<!-- ai-fp: ${fp} -->`;
+
               return [{
                 path: c.file,
                 line: c.start_line,
                 side: "RIGHT",
-                body: `**${title}**${meta}${rationale}${ev}${suggestion}`
+                body: `**${title}**${meta}${rationale}${ev}${suggestion}${fpMarker}`,
+                _fp: fp
               }];
             });
 
-            if (comments.length === 0) {
-              core.info("No inline comments to post; will still post a summary note next.");
-            } else {
-              const res = await github.rest.pulls.createReview({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number,
-                commit_id: headSha,
-                event: "COMMENT",
-                comments
-              });
-              core.info("Inline review posted. id=" + res.data?.id);
+            if (desired.length === 0) {
+              core.info("No inline comments to post after filtering.");
+              return;
             }
+
+            // Fetch existing review comments to avoid duplicates
+            const existing = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number,
+              per_page: 100
+            });
+
+            // Build a set of fingerprints already present
+            const existingFPs = new Set();
+            for (const c of existing) {
+              const m = /<!--\s*ai-fp:\s*([a-f0-9]{40})\s*-->/.exec(c.body || "");
+              if (m) existingFPs.add(m[1]);
+            }
+
+            // Only keep comments whose fingerprint is new
+            const toPost = desired.filter(c => !existingFPs.has(c._fp))
+                                  .map(({_fp, ...rest}) => rest);
+
+            if (toPost.length === 0) {
+              core.info("All AI inline comments already exist — skipping posting.");
+              return;
+            }
+
+            const res = await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number,
+              commit_id: headSha,
+              event: "COMMENT",
+              comments: toPost
+            });
+            core.info(`Inline review posted with ${toPost.length} new comment(s). id=${res.data?.id}`);
 
       # ---- Also post a high-level summary comment (one message on the PR)
       - name: Post PR summary comment
