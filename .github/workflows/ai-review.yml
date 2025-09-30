@@ -37,21 +37,28 @@ jobs:
           path: pr_diff.txt
 
       - name: Check diff not empty
+        id: diffcheck
         run: |
           if [ ! -s pr_diff.txt ]; then
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
             echo "No changes to review — skipping AI step."
-            exit 0
+          else
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Setup Node
+        if: steps.diffcheck.outputs.has_diff == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # ---- LLM call: request structured findings with head file line numbers
       - name: Run AI Review
+        if: steps.diffcheck.outputs.has_diff == 'true'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          # GitHub expressions don't support "||". Provide default in code instead.
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
         run: |
           npm init -y >/dev/null 2>&1
           npm install openai@latest >/dev/null 2>&1
@@ -59,13 +66,41 @@ jobs:
           import fs from "fs";
           import OpenAI from "openai";
 
-          async function main() {
-            const diff = fs.readFileSync("pr_diff.txt","utf8");
-            const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-            const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-            const sys = "You are a senior frontend reviewer. Review ONLY this diff. Return strict JSON {comments:[], summary}.";
-            const user = "# DIFF\n" + diff;
+          const diff = fs.readFileSync("pr_diff.txt","utf8");
+          const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
+          const sys =
+            "You are a senior frontend reviewer. You ONLY see a unified git diff. " +
+            "Return strict JSON with {comments:[], summary}. " +
+            "Each comment MUST include: file (repo-relative path as in the diff), start_line (line number in the HEAD file), end_line (optional), " +
+            "category (performance|security|a11y|practice), title, rationale, evidence (array of exact lines from the diff), " +
+            "suggestion (concise patch or code block), confidence (1-5). " +
+            "Be specific and actionable. If unsure about a line number, omit that comment.";
+
+          const example = {
+            comments: [{
+              file: "src/DemoIssue.tsx",
+              start_line: 12,
+              end_line: 16,
+              category: "practice",
+              title: "Missing dependency in useEffect",
+              rationale: "Effect uses `query` but dependency array is empty; this can cause stale requests.",
+              evidence: ["useEffect(() => {", "  fetch(`/api/search?q=${query}`)...", "}, []);"],
+              suggestion: "```diff\n- useEffect(() => { ... }, []);\n+ useEffect(() => { ... }, [query]);\n```",
+              confidence: 4
+            }],
+            summary: "Fix hook dependencies; sanitize innerHTML; add image alt and dimensions."
+          };
+
+          const user = `# DIFF
+          ${diff}
+
+          # OUTPUT FORMAT (JSON)
+          ${JSON.stringify(example, null, 2)}
+          `;
+
+          async function main() {
             try {
               const resp = await client.chat.completions.create({
                 model,
@@ -85,7 +120,7 @@ jobs:
                 comments: [],
                 summary: "AI call failed: " + (e?.message || String(e))
               }, null, 2));
-              process.exitCode = 1; // surface failure in logs
+              process.exitCode = 1;
             }
           }
           await main();
@@ -108,30 +143,80 @@ jobs:
           name: pr-review
           path: review.json
 
+      # ---- Create an inline review with comments on the diff
+      - name: Post inline review comments
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pull_number = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+
+            let data = { comments: [], summary: "No summary returned." };
+            try {
+              data = JSON.parse(fs.readFileSync('review.json','utf8'));
+            } catch (e) {
+              core.warning('Failed to parse review.json: ' + (e?.message || e));
+            }
+
+            // Build review comments array for GitHub's createReview
+            // We use line numbers relative to HEAD, on the RIGHT side.
+            const MAX = 12; // cap to avoid spam
+            const comments = (data.comments || []).slice(0, MAX).flatMap(c => {
+              if (!c?.file || !Number.isInteger(c?.start_line)) return [];
+              const title = c.title || "AI Review";
+              const rationale = c.rationale ? `\n\n${c.rationale}` : "";
+              const ev = Array.isArray(c.evidence) && c.evidence.length ? ("\n\n**Evidence:**\n" + c.evidence.map(l => `> ${l}`).join("\n")) : "";
+              const suggestion = c.suggestion ? ("\n\n" + c.suggestion) : "";
+              const meta = `\n\n_Category:_ **${(c.category||'note').toUpperCase()}** · _Confidence:_ **${c.confidence ?? '-'} / 5**`;
+
+              return [{
+                path: c.file,
+                line: c.start_line,
+                side: "RIGHT",
+                body: `**${title}**${meta}${rationale}${ev}${suggestion}`
+              }];
+            });
+
+            if (comments.length === 0) {
+              core.info("No inline comments to post; will still post a summary note next.");
+            } else {
+              const res = await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number,
+                commit_id: headSha,
+                event: "COMMENT",
+                comments
+              });
+              core.info("Inline review posted. id=" + res.data?.id);
+            }
+
+      # ---- Also post a high-level summary comment (one message on the PR)
       - name: Post PR summary comment
         if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const fs = require('fs');
+            let data = { comments: [], summary: "No summary returned." };
             try {
-              const fs = require('fs');
-              let data = { summary: "No summary returned." };
-              try {
-                const raw = fs.readFileSync('review.json','utf8');
-                console.log("review.json sample:", raw.slice(0, 300));
-                data = JSON.parse(raw);
-              } catch (e) {
-                core.warning('Failed to parse review.json: ' + (e?.message || e));
-              }
-              const body = `## 🤖 AI Review Summary\n${data.summary || 'No summary returned.'}\n\n*Generated by AI.*`;
-              const res = await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body
-              });
-              console.log("Comment created id:", res.data?.id);
-            } catch (err) {
-              core.setFailed("Posting PR comment failed: " + (err?.message || err));
+              data = JSON.parse(fs.readFileSync('review.json','utf8'));
+            } catch (e) {
+              core.warning('Failed to parse review.json: ' + (e?.message || e));
             }
+            const body = `## 🤖 AI Review Summary
+            ${data.summary || '—'}
+
+            *Generated by AI.*`;
+
+            const res = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+            core.info("Summary comment id: " + res.data?.id);
